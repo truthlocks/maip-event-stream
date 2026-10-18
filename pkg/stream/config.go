@@ -66,6 +66,9 @@ type StreamConfig struct {
 	RedisConsumerGroup string
 	// RedisConsumerName identifies this consumer within the group.
 	RedisConsumerName string
+	// RedisClaimMinIdle enables retired-consumer recovery when positive (Redis 6.2+).
+	// Zero disables claiming. Set above the longest valid handler duration.
+	RedisClaimMinIdle time.Duration
 
 	// --- NATS ---
 
@@ -111,6 +114,7 @@ func LoadConfigFromEnv() StreamConfig {
 		RedisStreamKey:     envOrDefault("MAIP_REDIS_STREAM_KEY", "maip:receipts"),
 		RedisMaxLen:        envOrDefaultInt64("MAIP_REDIS_MAXLEN", 100000),
 		RedisConsumerGroup: envOrDefault("MAIP_REDIS_CONSUMER_GROUP", "maip-consumers"),
+		RedisClaimMinIdle:  envOrDefaultDuration("MAIP_REDIS_CLAIM_MIN_IDLE", 0),
 		RedisConsumerName:  envOrDefault("MAIP_REDIS_CONSUMER_NAME", "consumer-1"),
 
 		// NATS
@@ -153,6 +157,9 @@ func (c StreamConfig) Validate() error {
 
 	switch c.Backend {
 	case BackendRedis:
+		if c.RedisClaimMinIdle < 0 || (c.RedisClaimMinIdle > 0 && c.RedisClaimMinIdle < time.Millisecond) {
+			return fmt.Errorf("redis claim minimum idle must be zero or at least one millisecond")
+		}
 		if c.RedisURL == "" {
 			return fmt.Errorf("redis backend requires REDIS_URL")
 		}

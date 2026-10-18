@@ -35,6 +35,7 @@ type Subscriber struct {
 	consumerName string
 	batchSize    int64
 	blockMs      int64
+	claimMinIdle time.Duration
 	logger       *slog.Logger
 
 	mu      sync.Mutex
@@ -73,6 +74,7 @@ func NewSubscriber(client RedisStreamAPI, cfg stream.StreamConfig) *Subscriber {
 		consumerName: consumerName,
 		batchSize:    batchSize,
 		blockMs:      5000,
+		claimMinIdle: cfg.RedisClaimMinIdle,
 		logger:       slog.Default().With("component", "redis-subscriber"),
 	}
 }
@@ -92,6 +94,16 @@ func (s *Subscriber) Subscribe(ctx context.Context, handler stream.EventHandler)
 	if handler == nil {
 		s.mu.Unlock()
 		return fmt.Errorf("redis: event handler is required")
+	}
+	if s.claimMinIdle < 0 || (s.claimMinIdle > 0 && s.claimMinIdle < time.Millisecond) {
+		s.mu.Unlock()
+		return fmt.Errorf("redis: claim minimum idle must be zero or at least one millisecond")
+	}
+	if s.claimMinIdle > 0 {
+		if _, ok := s.client.(RedisPendingClaimer); !ok {
+			s.mu.Unlock()
+			return fmt.Errorf("redis: configured pending recovery requires a RedisPendingClaimer adapter")
+		}
 	}
 	s.running = true
 	ctx, s.cancel = context.WithCancel(ctx)
@@ -123,6 +135,8 @@ func (s *Subscriber) Subscribe(ctx context.Context, handler stream.EventHandler)
 	// Walk this durable consumer's pending entries before reading new entries,
 	// then repeat periodically. Advancing the cursor prevents a poison entry
 	// from starving later pending messages. Never ACK a failed handler.
+	claimCursor := "0-0"
+	claimDue := s.claimMinIdle > 0
 	pendingCursor := "0"
 	recoverPending := true
 	nextRecovery := time.Now().Add(5 * time.Second)
@@ -136,6 +150,17 @@ func (s *Subscriber) Subscribe(ctx context.Context, handler stream.EventHandler)
 
 		if !recoverPending && !time.Now().Before(nextRecovery) {
 			recoverPending, pendingCursor = true, "0"
+			claimDue = s.claimMinIdle > 0
+		}
+		if claimDue {
+			next, err := s.client.(RedisPendingClaimer).ClaimPending(ctx, s.streamKey, s.group, s.consumerName, s.claimMinIdle, claimCursor, s.batchSize)
+			if err != nil {
+				// Fail visibly: callers can restart with backoff. No failed claim is ACKed.
+				return fmt.Errorf("redis: recover idle pending entries: %w", err)
+			}
+			claimCursor, claimDue = next, false
+			// Claimed entries now belong to this consumer and are processed by the
+			// ordinary pending walk, preserving decoding, handler and explicit ACK rules.
 		}
 		position, block := ">", s.blockMs
 		if recoverPending {

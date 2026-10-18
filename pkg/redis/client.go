@@ -52,3 +52,18 @@ func (c *Client) XReadGroup(ctx context.Context, a *XReadGroupArgs) ([]XStream, 
 }
 
 var _ RedisStreamAPI = (*Client)(nil)
+
+// RedisPendingClaimer is optional for custom adapters; it requires Redis 6.2+.
+// ClaimPending transfers ownership without acknowledging or invoking handlers.
+type RedisPendingClaimer interface {
+	ClaimPending(context.Context, string, string, string, time.Duration, string, int64) (string, error)
+}
+
+func (c *Client) ClaimPending(ctx context.Context, key, group, consumer string, idle time.Duration, start string, count int64) (string, error) {
+	_, next, err := c.client.XAutoClaim(ctx, &redisclient.XAutoClaimArgs{
+		Stream: key, Group: group, Consumer: consumer, MinIdle: idle, Start: start, Count: count,
+	}).Result()
+	return next, err
+}
+
+var _ RedisPendingClaimer = (*Client)(nil)

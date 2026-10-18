@@ -274,3 +274,26 @@ func TestSubscriber_ReceiveAndAcknowledge(t *testing.T) {
 		t.Errorf("expected stream ID '1234-0' to be acked, got %v", mock.acked)
 	}
 }
+
+func TestSubscriberClaimRequiresSupportedAdapter(t *testing.T) {
+	for _, idle := range []time.Duration{-time.Second, time.Nanosecond, time.Second} {
+		s := NewSubscriber(&mockRedisStreamAPI{}, stream.StreamConfig{RedisClaimMinIdle: idle})
+		if err := s.Subscribe(context.Background(), func(context.Context, stream.Event) error { t.Fatal("unexpected delivery"); return nil }); err == nil {
+			t.Fatal("invalid/unsupported recovery accepted")
+		}
+	}
+}
+
+type failedClaimer struct{ mockRedisStreamAPI }
+
+func (*failedClaimer) ClaimPending(context.Context, string, string, string, time.Duration, string, int64) (string, error) {
+	return "", fmt.Errorf("claim unavailable")
+}
+func TestSubscriberClaimFailureDoesNotAcknowledge(t *testing.T) {
+	c := &failedClaimer{}
+	s := NewSubscriber(c, stream.StreamConfig{RedisClaimMinIdle: time.Second})
+	err := s.Subscribe(context.Background(), func(context.Context, stream.Event) error { t.Fatal("unexpected delivery"); return nil })
+	if err == nil || len(c.acked) != 0 {
+		t.Fatalf("claim failure swallowed/ACKed: %v", err)
+	}
+}

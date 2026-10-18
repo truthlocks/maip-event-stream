@@ -13,7 +13,8 @@ import (
 )
 
 // An isolated Unix-socket broker: no production URL, network listener or data.
-func TestRealRedisRestartRecovery(t *testing.T) {
+func isolatedRedis(t *testing.T) (*Client, context.Context) {
+	t.Helper()
 	binary := os.Getenv("TRUTHLOCKS_REDIS_SERVER")
 	if binary == "" {
 		var err error
@@ -39,13 +40,18 @@ func TestRealRedisRestartRecovery(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = c.Close() })
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	t.Cleanup(cancel)
 	for c.Ping(ctx) != nil {
 		if ctx.Err() != nil {
 			t.Fatal("isolated Redis did not start")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	return c, ctx
+}
+
+func TestRealRedisRestartRecovery(t *testing.T) {
+	c, ctx := isolatedRedis(t)
 	cfg := stream.StreamConfig{RedisStreamKey: "qa:recovery", RedisConsumerGroup: "qa", RedisConsumerName: "worker-a", BatchSize: 1}
 	p := NewPublisher(c, cfg)
 	if err := p.Publish(ctx, newTestEvent("one", "qa"), newTestEvent("two", "qa"), newTestEvent("three", "qa")); err != nil {
@@ -54,7 +60,7 @@ func TestRealRedisRestartRecovery(t *testing.T) {
 	first := NewSubscriber(c, cfg)
 	firstCtx, stopFirst := context.WithCancel(ctx)
 	seen := 0
-	err = first.Subscribe(firstCtx, func(context.Context, stream.Event) error {
+	err := first.Subscribe(firstCtx, func(context.Context, stream.Event) error {
 		seen++
 		if seen == 2 {
 			stopFirst()
@@ -111,5 +117,71 @@ func TestRealRedisRestartRecovery(t *testing.T) {
 	rows, err := c.XReadGroup(ctx, &XReadGroupArgs{Group: cfg.RedisConsumerGroup, Consumer: cfg.RedisConsumerName, Streams: []string{cfg.RedisStreamKey, ">"}, Count: 1, Block: 10})
 	if err != nil || len(rows) != 0 {
 		t.Fatalf("normal empty read must not fail: %v %v", rows, err)
+	}
+}
+
+func TestRealRedisRetiredConsumerRecovery(t *testing.T) {
+	c, ctx := isolatedRedis(t)
+	cfg := stream.StreamConfig{RedisStreamKey: "qa:retired", RedisConsumerGroup: "qa", RedisConsumerName: "retired", BatchSize: 1}
+	if err := NewPublisher(c, cfg).Publish(ctx, newTestEvent("recover-me", "qa")); err != nil {
+		t.Fatal(err)
+	}
+	old := NewSubscriber(c, cfg)
+	oldCtx, stopOld := context.WithCancel(ctx)
+	err := old.Subscribe(oldCtx, func(context.Context, stream.Event) error {
+		stopOld()
+		return errors.New("crashed before acknowledgement")
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	assertOwner := func(want string) {
+		t.Helper()
+		pending, err := c.client.XPending(ctx, cfg.RedisStreamKey, cfg.RedisConsumerGroup).Result()
+		if err != nil || pending.Count != 1 || pending.Consumers[want] != 1 {
+			t.Fatalf("pending owner %s: %+v %v", want, pending, err)
+		}
+	}
+	cfg.RedisConsumerName = "replacement"
+	for _, idle := range []time.Duration{0, time.Hour} {
+		cfg.RedisClaimMinIdle = idle
+		s := NewSubscriber(c, cfg)
+		s.blockMs = 10
+		short, stop := context.WithTimeout(ctx, 50*time.Millisecond)
+		err := s.Subscribe(short, func(context.Context, stream.Event) error { t.Fatal("live/disabled claim stole an entry"); return nil })
+		stop()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatal(err)
+		}
+		assertOwner("retired")
+	}
+	cfg.RedisClaimMinIdle = time.Millisecond
+	replacement := NewSubscriber(c, cfg)
+	failedCtx, stopFailed := context.WithCancel(ctx)
+	err = replacement.Subscribe(failedCtx, func(context.Context, stream.Event) error { stopFailed(); return errors.New("replacement also failed") })
+	if !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	assertOwner("replacement")
+	restarted := NewSubscriber(c, cfg)
+	done, stopDone := context.WithCancel(ctx)
+	calls := 0
+	err = restarted.Subscribe(done, func(ctx context.Context, e stream.Event) error {
+		calls++
+		if e.ID != "recover-me" {
+			t.Fatalf("wrong payload: %s", e.ID)
+		}
+		if err := restarted.Acknowledge(ctx, e.ID); err != nil {
+			t.Fatal(err)
+		}
+		stopDone()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) || calls != 1 {
+		t.Fatalf("recovery: %v calls=%d", err, calls)
+	}
+	pending, err := c.client.XPending(ctx, cfg.RedisStreamKey, cfg.RedisConsumerGroup).Result()
+	if err != nil || pending.Count != 0 {
+		t.Fatalf("ACK not durable: %+v %v", pending, err)
 	}
 }

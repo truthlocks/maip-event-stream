@@ -7,7 +7,7 @@ Go building blocks for moving and describing machine-action evidence in your eve
 Install the Go library in your own module:
 
 ```sh
-go get github.com/truthlocks/maip-event-stream@v0.1.0
+go get github.com/truthlocks/maip-event-stream@v0.1.1
 ```
 
 Version 0.1.0 is an initial library release. Redis has a concrete client and an
@@ -151,8 +151,21 @@ failed entries so later pending messages can still be processed. Handlers must b
 idempotent: processing can repeat until the application acknowledges success.
 
 Keep a stable, unique consumer name for each worker across restarts. This recovery
-handles that consumer's pending entries; it does not claim entries belonging to a
-different consumer. Retiring a consumer requires an operator-managed claim process.
+handles that consumer's pending entries by default. To recover entries from retired
+consumers, opt in with `RedisClaimMinIdle: 10 * time.Minute` or
+`MAIP_REDIS_CLAIM_MIN_IDLE=10m`. Choose a threshold **longer than the maximum valid
+handler duration**: Redis measures delivery idle time, not whether a worker is alive.
+A slow active handler can otherwise race with its replacement. Keep handlers
+idempotent; this is at-least-once delivery, not exactly-once processing.
+
+Recovery requires Redis 6.2+ and permission for
+[XAUTOCLAIM](https://redis.io/docs/latest/commands/xautoclaim/). Zero disables it;
+negative or positive sub-millisecond values are rejected. One bounded claim batch
+is scanned per pending-recovery cycle, with a cursor carried between cycles.
+Claimed entries use the normal decode/handler/explicit-ACK path. Failed handlers
+remain pending. Claim errors stop subscription visibly; the caller should retry
+with backoff and alert on persistent failure. Custom adapters must implement
+`RedisPendingClaimer` when opting in. This does not recover trimmed payloads.
 Client wrappers must omit BLOCK for a negative `XReadGroupArgs.Block`, and implement
 explicit pending-ID reads as well as `>` reads. Pending payloads that were trimmed
 from the stream cannot be recovered. Use an appropriate retention configuration
